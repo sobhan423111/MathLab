@@ -1,0 +1,198 @@
+name: Release on commit
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find release commits and create releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+
+          echo "========================================="
+          echo "Starting release workflow"
+          echo "Push: $BEFORE -> $AFTER"
+          echo "========================================="
+
+          # Extract non-merge commits from the push event itself (avoids range errors)
+          echo "Extracting commit list from push event..."
+          ALL_EVENT_COMMITS=$(jq -r '.commits[].id // empty' "$GITHUB_EVENT_PATH")
+          if [ -z "$ALL_EVENT_COMMITS" ]; then
+            echo "No commits in push event. Exiting."
+            exit 0
+          fi
+
+          echo "All commits in this push:"
+          echo "$ALL_EVENT_COMMITS" | while read sha; do echo "  $sha"; done
+
+          # Filter out merge commits
+          echo "Filtering out merge commits..."
+          PUSH_COMMITS=""
+          for sha in $ALL_EVENT_COMMITS; do
+            if git log -1 --no-merges "$sha" >/dev/null 2>&1; then
+              PUSH_COMMITS="$PUSH_COMMITS $sha"
+              echo "  $sha is a non‑merge commit"
+            else
+              echo "  $sha is a merge commit, skipping"
+            fi
+          done
+
+          PUSH_COMMITS=$(echo "$PUSH_COMMITS" | xargs)  # trim extra spaces
+          if [ -z "$PUSH_COMMITS" ]; then
+            echo "No non‑merge commits in this push. Exiting."
+            exit 0
+          fi
+
+          echo "Non‑merge commits to inspect (in event order):"
+          for sha in $PUSH_COMMITS; do
+            echo "  $sha"
+          done
+
+          # Locate the last release commit before this push
+          PREV_RELEASE=""
+          if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            echo "Scanning history before $BEFORE for any commit containing 'release this commit'..."
+            for candidate in $(git rev-list --no-merges "$BEFORE"); do
+              # CHANGED: check anywhere in message
+              if git log -1 --format="%B" "$candidate" | grep -qF "release this commit"; then
+                PREV_RELEASE="$candidate"
+                echo "Found previous release commit: $PREV_RELEASE"
+                break
+              fi
+            done
+            if [ -z "$PREV_RELEASE" ]; then
+              echo "No previous release commit found before $BEFORE"
+            fi
+          else
+            echo "BEFORE is either zero (new branch) or doesn't exist; no previous release to search."
+          fi
+
+          # Process each eligible commit
+          for sha in $PUSH_COMMITS; do
+            echo ""
+            echo "-----------------------------------------"
+            echo "Inspecting commit $sha..."
+
+            # CHANGED: check if message contains 'release this commit' anywhere
+            if ! git log -1 --format="%B" "$sha" | grep -qF "release this commit"; then
+              echo "Commit $sha does NOT contain 'release this commit' → skipping."
+              continue
+            fi
+
+            echo ">>> This is a RELEASE commit."
+
+            # Extract version from version.txt at this commit
+            echo "Extracting version from version.txt at $sha..."
+            VERSION=$(git show "$sha:version.txt" | head -1 | tr -d '[:space:]')
+            echo "Version: '$VERSION'"
+
+            VERSION_REGEX='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$'
+            if ! echo "$VERSION" | grep -Eq "$VERSION_REGEX"; then
+              echo "ERROR: Invalid version format: '$VERSION'" >&2
+              exit 1
+            fi
+
+            if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+              echo "Tag v$VERSION already exists. Skipping this release."
+              continue
+            fi
+
+            # Determine commit range for changelog
+            if [ -z "$PREV_RELEASE" ]; then
+              echo "No previous release commit → gathering all commits from the beginning to $sha"
+              RANGE_COMMITS=$(git rev-list --no-merges --reverse "$sha" 2>/dev/null || echo "")
+            else
+              echo "Previous release: $PREV_RELEASE"
+              echo "Gathering commits from after $PREV_RELEASE to $sha (exclusive)"
+              RANGE_COMMITS=$(git rev-list --no-merges --reverse "${PREV_RELEASE}..${sha}" 2>/dev/null || echo "")
+            fi
+
+            if [ -z "$RANGE_COMMITS" ]; then
+              echo "WARNING: No commits found in range. The changelog will be minimal."
+              RANGE_COMMITS=""
+            else
+              echo "Commits in changelog range:"
+              for c in $RANGE_COMMITS; do
+                echo "  $c"
+              done
+            fi
+
+            # Generate changelog file
+            CHANGELOG_FILE="changelog-${VERSION}.md"
+            echo "Generating changelog: $CHANGELOG_FILE"
+            {
+              echo "# Changelog for MathLab v${VERSION}"
+              echo ""
+            } > "$CHANGELOG_FILE"
+
+            for commit in $RANGE_COMMITS; do
+              short=$(git rev-parse --short "$commit")
+              message=$(git log -1 --format="%B" "$commit")
+              stat=$(git show --stat --format="" "$commit" 2>/dev/null || echo "")
+
+              echo "" >> "$CHANGELOG_FILE"
+              echo "### Commit $short" >> "$CHANGELOG_FILE"
+              echo "" >> "$CHANGELOG_FILE"
+              echo "$message" >> "$CHANGELOG_FILE"
+              echo "" >> "$CHANGELOG_FILE"
+              if [ -n "$stat" ]; then
+                echo '```diff' >> "$CHANGELOG_FILE"
+                echo "$stat" >> "$CHANGELOG_FILE"
+                echo '```' >> "$CHANGELOG_FILE"
+              fi
+            done
+            echo "" >> "$CHANGELOG_FILE"
+            echo "Changelog created."
+
+            # Prepare release notes: remove lines containing the trigger phrase
+            FULL_MESSAGE=$(git log -1 --format="%B" "$sha")
+            # CHANGED: filter out any line that contains "release this commit"
+            BODY=$(echo "$FULL_MESSAGE" | grep -vF "release this commit")
+            NOTES=$(echo "$BODY" | sed -E 's/\bcommit\b/version/g; s/\bCommit\b/Version/g')
+            NOTES+=$'\n\n'"This release was automatically created by a GitHub workflow/action."
+
+            echo "Release notes:"
+            echo "$NOTES"
+            echo ""
+
+            # Prerelease flag
+            PRERELEASE_FLAG=""
+            if echo "$VERSION" | grep -qiE 'alpha|beta'; then
+              PRERELEASE_FLAG="--prerelease"
+              echo "Pre‑release flag set (version contains alpha/beta)."
+            fi
+
+            echo "Creating GitHub release v${VERSION}..."
+            gh release create "v${VERSION}" "$CHANGELOG_FILE" \
+              --title "MathLab ${VERSION}" \
+              --notes "$NOTES" \
+              --target "$sha" \
+              $PRERELEASE_FLAG
+
+            echo "Release v${VERSION} created successfully!"
+
+            # Update for any subsequent release commits in the same push
+            PREV_RELEASE="$sha"
+          done
+
+          echo "========================================="
+          echo "All releases processed."
+          echo "========================================="
